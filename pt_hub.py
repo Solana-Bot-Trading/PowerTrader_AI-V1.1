@@ -10,8 +10,22 @@ import subprocess
 import shutil
 import glob
 import bisect
+import base64
+import uuid
+import datetime
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+
+# Optional imports for the Manual Buy Robinhood client.
+# These packages are already installed by pt_trader; handle missing gracefully.
+try:
+    import requests as _requests
+    from nacl.signing import SigningKey as _SigningKey
+    _RH_CLIENT_DEPS_OK = True
+except ImportError:
+    _requests = None      # type: ignore
+    _SigningKey = None    # type: ignore
+    _RH_CLIENT_DEPS_OK = False
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk, filedialog, messagebox
@@ -455,6 +469,170 @@ def _fmt_pct(x: float) -> str:
 
 def _now_str() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+# -----------------------------
+# Robinhood Direct Client
+# Used exclusively by the Manual Buy panel in the Controls / Health tab.
+# Mirrors the auth logic from pt_trader.py so pt_hub can place one-off
+# market buys without depending on the trader subprocess being alive.
+# -----------------------------
+
+class _RobinhoodDirectClient:
+    """
+    Minimal Robinhood crypto API client for the Manual Buy feature.
+    Reads credentials from the same r_key.txt / r_secret.txt files that
+    pt_trader.py uses.  All methods return (success: bool, message: str)
+    or a value on success.
+    """
+
+    BASE_URL = "https://trading.robinhood.com"
+
+    def __init__(self, key_path: str = "r_key.txt", secret_path: str = "r_secret.txt"):
+        self._ok = False
+        self._err = ""
+        self._api_key = ""
+        self._private_key = None
+
+        if not _RH_CLIENT_DEPS_OK:
+            self._err = (
+                "Missing packages: 'requests' and/or 'nacl' are required.\n"
+                "They should already be installed with pt_trader.  "
+                "Run: pip install requests pynacl"
+            )
+            return
+
+        try:
+            with open(key_path, "r", encoding="utf-8") as f:
+                self._api_key = (f.read() or "").strip()
+            with open(secret_path, "r", encoding="utf-8") as f:
+                raw_secret = (f.read() or "").strip()
+
+            if not self._api_key or not raw_secret:
+                self._err = "r_key.txt or r_secret.txt is empty. Use Settings → Robinhood API → Setup Wizard."
+                return
+
+            seed = base64.b64decode(raw_secret)
+            self._private_key = _SigningKey(seed)
+            self._ok = True
+
+        except FileNotFoundError as exc:
+            self._err = (
+                f"Credential file not found: {exc.filename}\n"
+                "Use Settings → Robinhood API → Setup Wizard to create them."
+            )
+        except Exception as exc:
+            self._err = f"Failed to load Robinhood credentials: {exc}"
+
+    @property
+    def ready(self) -> bool:
+        return self._ok
+
+    @property
+    def error(self) -> str:
+        return self._err
+
+    @staticmethod
+    def _timestamp() -> int:
+        return int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp())
+
+    def _auth_headers(self, method: str, path: str, body: str) -> dict:
+        ts = self._timestamp()
+        msg = f"{self._api_key}{ts}{path}{method}{body}"
+        signed = self._private_key.sign(msg.encode("utf-8"))
+        return {
+            "x-api-key": self._api_key,
+            "x-signature": base64.b64encode(signed.signature).decode("utf-8"),
+            "x-timestamp": str(ts),
+        }
+
+    def _request(self, method: str, path: str, body: str = "") -> Optional[dict]:
+        try:
+            headers = self._auth_headers(method, path, body)
+            url = self.BASE_URL + path
+            if method == "GET":
+                resp = _requests.get(url, headers=headers, timeout=15)
+            elif method == "POST":
+                resp = _requests.post(url, headers=headers, json=json.loads(body) if body else {}, timeout=15)
+            else:
+                return None
+            resp.raise_for_status()
+            return resp.json()
+        except Exception:
+            try:
+                return resp.json()
+            except Exception:
+                return None
+
+    def get_valid_symbols(self) -> List[str]:
+        """Return list of valid trading pair symbols e.g. ['BTC-USD', 'ETH-USD', ...]"""
+        try:
+            resp = self._request("GET", "/api/v1/crypto/trading/trading_pairs/")
+            if resp and "results" in resp:
+                return [p["symbol"] for p in resp["results"] if p.get("symbol")]
+        except Exception:
+            pass
+        return []
+
+    def get_best_ask(self, symbol: str) -> Optional[float]:
+        """Return current ask (buy) price for a symbol like 'DOGE-USD'."""
+        try:
+            path = f"/api/v1/crypto/marketdata/best_bid_ask/?symbol={symbol}"
+            resp = self._request("GET", path)
+            if resp and "results" in resp and resp["results"]:
+                return float(resp["results"][0]["ask_inclusive_of_buy_spread"])
+        except Exception:
+            pass
+        return None
+
+    def place_market_buy(self, symbol_base: str, amount_usd: float) -> Tuple[bool, str]:
+        """
+        Place a market buy for `amount_usd` dollars of `symbol_base` (e.g. 'DOGE').
+        Returns (success, message).
+        """
+        if not self._ok:
+            return False, self._err
+
+        symbol = f"{symbol_base.strip().upper()}-USD"
+
+        # Validate symbol against available pairs
+        valid = self.get_valid_symbols()
+        if valid and symbol not in valid:
+            return False, f"'{symbol}' is not a valid Robinhood trading pair."
+
+        # Get current price to calculate quantity
+        ask = self.get_best_ask(symbol)
+        if not ask or ask <= 0.0:
+            return False, f"Could not retrieve current price for {symbol}."
+
+        asset_qty = amount_usd / ask
+        rounded_qty = round(asset_qty, 8)
+
+        body_dict = {
+            "client_order_id": str(uuid.uuid4()),
+            "side": "buy",
+            "type": "market",
+            "symbol": symbol,
+            "market_order_config": {
+                "asset_quantity": f"{rounded_qty:.8f}"
+            },
+        }
+        body_str = json.dumps(body_dict)
+
+        resp = self._request("POST", "/api/v1/crypto/trading/orders/", body_str)
+        if not resp:
+            return False, "No response from Robinhood. Check credentials and connectivity."
+
+        if "errors" in resp or "error" in resp:
+            err_detail = resp.get("errors") or resp.get("error") or resp
+            return False, f"Order rejected: {err_detail}"
+
+        order_id = resp.get("id", "unknown")
+        state = resp.get("state", "unknown")
+        return True, (
+            f"Order placed for {rounded_qty:.8f} {symbol_base.upper()} "
+            f"(~${amount_usd:.2f} at ${ask:,.4f})  |  ID: {order_id}  |  State: {state}"
+        )
 
 
 # -----------------------------
@@ -2319,6 +2497,54 @@ class PowerTraderHub(tk.Tk):
         self.lbl_pnl = ttk.Label(acct_box, text="Total realized: N/A")
         self.lbl_pnl.pack(anchor="w", padx=6, pady=(2, 2))
 
+
+        # ----------------------------
+        # Manual Buy Panel
+        # ----------------------------
+        manual_buy_box = ttk.LabelFrame(controls_left, text="Manual Buy")
+        manual_buy_box.pack(fill="x", padx=6, pady=(0, 6))
+
+        # Row 1: inputs + button
+        mb_row1 = ttk.Frame(manual_buy_box)
+        mb_row1.pack(fill="x", padx=6, pady=(6, 2))
+
+        ttk.Label(mb_row1, text="Coin:").pack(side="left")
+        self._mb_coin_var = tk.StringVar()
+        mb_coin_entry = ttk.Entry(mb_row1, textvariable=self._mb_coin_var, width=7)
+        mb_coin_entry.pack(side="left", padx=(4, 10))
+
+        ttk.Label(mb_row1, text="Amount $:").pack(side="left")
+        self._mb_amount_var = tk.StringVar()
+        mb_amount_entry = ttk.Entry(mb_row1, textvariable=self._mb_amount_var, width=8)
+        mb_amount_entry.pack(side="left", padx=(4, 10))
+
+        self._mb_buy_btn = ttk.Button(
+            mb_row1,
+            text="Buy Now",
+            width=10,
+            command=self._on_manual_buy_click,
+        )
+        self._mb_buy_btn.pack(side="left")
+
+        # Row 2: auto-train checkbox + status label
+        mb_row2 = ttk.Frame(manual_buy_box)
+        mb_row2.pack(fill="x", padx=6, pady=(2, 6))
+
+        self._mb_auto_train_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            mb_row2,
+            text="Auto-train after buy",
+            variable=self._mb_auto_train_var,
+        ).pack(side="left")
+
+        self._mb_status_var = tk.StringVar(value="Ready")
+        ttk.Label(
+            mb_row2,
+            textvariable=self._mb_status_var,
+            foreground=DARK_MUTED,
+            wraplength=260,
+            justify="left",
+        ).pack(side="left", padx=(10, 0))
 
 
         # Neural levels overview (spans FULL width under the dual section)
@@ -5315,6 +5541,150 @@ class PowerTraderHub(tk.Tk):
 
         ttk.Button(btns, text="Save", command=save).pack(side="left")
         ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="left", padx=8)
+
+
+    # ---- manual buy ----
+
+    def _on_manual_buy_click(self) -> None:
+        """Validate inputs and kick off a background buy thread."""
+        coin_raw = (self._mb_coin_var.get() or "").strip().upper()
+        amount_raw = (self._mb_amount_var.get() or "").strip().replace("$", "").replace(",", "")
+
+        if not coin_raw:
+            self._mb_status_var.set("Error: Enter a coin symbol (e.g. DOGE).")
+            return
+
+        try:
+            amount_usd = float(amount_raw)
+        except ValueError:
+            self._mb_status_var.set("Error: Amount must be a number (e.g. 25.00).")
+            return
+
+        if amount_usd <= 0.0:
+            self._mb_status_var.set("Error: Amount must be greater than $0.")
+            return
+
+        # Disable button while working
+        self._mb_buy_btn.configure(state="disabled")
+        self._mb_status_var.set(f"Placing buy for ${amount_usd:.2f} of {coin_raw}...")
+
+        do_train = bool(self._mb_auto_train_var.get())
+
+        t = threading.Thread(
+            target=self._do_manual_buy,
+            args=(coin_raw, amount_usd, do_train),
+            daemon=True,
+        )
+        t.start()
+
+    def _do_manual_buy(self, coin: str, amount_usd: float, auto_train: bool) -> None:
+        """
+        Background thread: place the buy via Robinhood, add coin to gui_settings.json,
+        create the neural folder, copy the trainer, refresh the UI.
+        All UI updates are posted back to the main thread via self.after().
+        """
+        def _set_status(msg: str, color: str = DARK_MUTED) -> None:
+            self.after(0, lambda: self._mb_status_var.set(msg))
+
+        def _re_enable() -> None:
+            self.after(0, lambda: self._mb_buy_btn.configure(state="normal"))
+
+        try:
+            client = _RobinhoodDirectClient()
+            if not client.ready:
+                _set_status(f"Error: {client.error}")
+                _re_enable()
+                return
+
+            success, msg = client.place_market_buy(coin, amount_usd)
+
+            if not success:
+                _set_status(f"Error: {msg}")
+                _re_enable()
+                return
+
+            # --- Buy succeeded: update gui_settings.json ---
+            try:
+                settings_path = os.path.join(self.project_dir, SETTINGS_FILE)
+                with open(settings_path, "r", encoding="utf-8") as f:
+                    settings_data = json.load(f)
+
+                current_coins = [
+                    str(c).strip().upper()
+                    for c in (settings_data.get("coins") or [])
+                    if str(c).strip()
+                ]
+
+                prev_coins_set = set(current_coins)
+
+                if coin not in current_coins:
+                    current_coins.append(coin)
+                    settings_data["coins"] = current_coins
+
+                    tmp = f"{settings_path}.tmp"
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(settings_data, f, indent=2)
+                    os.replace(tmp, settings_path)
+
+                    coin_added_to_settings = True
+                else:
+                    coin_added_to_settings = False
+
+                # --- Create neural folder + copy trainer if needed ---
+                try:
+                    main_dir = settings_data.get("main_neural_dir") or self.project_dir
+                    trainer_name = os.path.basename(
+                        str(settings_data.get("script_neural_trainer", "pt_trainer.py"))
+                    )
+                    src_trainer = os.path.join(main_dir, trainer_name)
+                    if not os.path.isfile(src_trainer):
+                        # fallback to configured path
+                        src_trainer = str(settings_data.get("script_neural_trainer", trainer_name))
+
+                    if coin != "BTC":
+                        coin_dir = os.path.join(main_dir, coin)
+                        os.makedirs(coin_dir, exist_ok=True)
+                        dst_trainer = os.path.join(coin_dir, trainer_name)
+                        if not os.path.isfile(dst_trainer) and os.path.isfile(src_trainer):
+                            shutil.copy2(src_trainer, dst_trainer)
+
+                except Exception as folder_err:
+                    # Non-fatal: log but continue
+                    _set_status(
+                        f"Buy OK but folder setup warning: {folder_err}. {msg}"
+                    )
+
+                # --- Refresh UI on main thread ---
+                def _refresh():
+                    try:
+                        self.settings = dict(settings_data)
+                        self._refresh_coin_dependent_ui(list(prev_coins_set))
+                        suffix = " (added to coin list)" if coin_added_to_settings else " (already in list)"
+                        _set_status(f"Success{suffix}: {msg}")
+                    except Exception:
+                        _set_status(f"Buy OK: {msg}")
+
+                self.after(0, _refresh)
+
+            except Exception as save_err:
+                _set_status(f"Buy placed but could not update settings: {save_err}  |  {msg}")
+
+            # --- Optional auto-train ---
+            if auto_train:
+                def _trigger_train():
+                    try:
+                        if hasattr(self, "train_coin_var"):
+                            self.train_coin_var.set(coin)
+                        self.train_selected_coin()
+                    except Exception:
+                        pass
+                self.after(500, _trigger_train)
+
+        except Exception as exc:
+            _set_status(f"Unexpected error: {exc}")
+
+        finally:
+            _re_enable()
 
 
     # ---- close ----
