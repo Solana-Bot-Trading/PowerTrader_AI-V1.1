@@ -28,8 +28,6 @@ For a detailed list of all improvements, see [IMPROVEMENTS_SUMMARY.md](IMPROVEME
 
 # Original README Content Follows
 
-(Keep all the original README content below this line)
-
 
 # PowerTrader_AI
 Fully automated crypto trading powered by a custom price prediction AI and a structured/tiered DCA system.
