@@ -24,9 +24,12 @@ For a detailed list of all improvements, see [IMPROVEMENTS_SUMMARY.md](IMPROVEME
 - 3-tier profit system vs single all-or-nothing exit
 - 4 new performance tracking metrics
 
----
 
 Added Manual Buy. 3.1.26
+
+---
+
+
 
 # Original README Content Follows
 
