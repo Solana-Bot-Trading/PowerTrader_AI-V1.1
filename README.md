@@ -13,6 +13,7 @@ This fork adds comprehensive small account optimizations and advanced risk manag
 - **✅ Reserve Capital Management** - Enforces 20% minimum cash reserve
 - **✅ Enhanced GUI Metrics** - Win rate, avg win/loss, best/worst coin tracking
 - **✅ 100% Backward Compatible** - All original functionality preserved
+- **✅ Manually buy coins within the Bot** - All original functionality preserved
 
 ### 📊 Improvements Summary
 
