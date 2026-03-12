@@ -1,4 +1,4 @@
-# PowerTrader AI V1.1 - Enhanced Fork
+# PowerTrader AI V1.2 - Enhanced Fork
 
 **This is an enhanced fork of [garagesteve1155/PowerTrader_AI](https://github.com/garagesteve1155/PowerTrader_AI)**
 
