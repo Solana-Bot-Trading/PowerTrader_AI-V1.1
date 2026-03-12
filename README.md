@@ -28,6 +28,7 @@ For a detailed list of all improvements, see [IMPROVEMENTS_SUMMARY.md](IMPROVEME
 
 3.1.2026 - Added Manual Buy to the gui. you have the choice to Auto train or manually train the added coin.
 
+3.11.26 - Added a Manual Sell panel to the Controls / Health tab, directly below the existing Manual Buy panel. Allows the user to place an immediate 100% market sell of any held coin directly from the Hub GUI without leaving the application.
 ---
 
 
