@@ -2700,6 +2700,45 @@ class PowerTraderHub(tk.Tk):
         ).pack(side="left", padx=(0, 0))
 
 
+        # ----------------------------
+        # Tax Export Panel (Form 8949)
+        # ----------------------------
+        tax_export_box = ttk.LabelFrame(controls_left, text="Tax Export (Form 8949)")
+        tax_export_box.pack(fill="x", padx=6, pady=(0, 6))
+
+        tax_row1 = ttk.Frame(tax_export_box)
+        tax_row1.pack(fill="x", padx=6, pady=(6, 2))
+
+        ttk.Label(tax_row1, text="Tax Year:").pack(side="left")
+        self._tax_year_var = tk.StringVar(value=str(datetime.datetime.now().year))
+        self._tax_year_entry = ttk.Entry(
+            tax_row1,
+            textvariable=self._tax_year_var,
+            width=6,
+        )
+        self._tax_year_entry.pack(side="left", padx=(4, 8))
+
+        self._tax_export_btn = ttk.Button(
+            tax_row1,
+            text="Export 8949 CSV",
+            width=16,
+            command=self._on_tax_export_click,
+        )
+        self._tax_export_btn.pack(side="left")
+
+        tax_row2 = ttk.Frame(tax_export_box)
+        tax_row2.pack(fill="x", padx=6, pady=(2, 6))
+
+        self._tax_status_var = tk.StringVar(value="Ready")
+        ttk.Label(
+            tax_row2,
+            textvariable=self._tax_status_var,
+            foreground=DARK_MUTED,
+            wraplength=260,
+            justify="left",
+        ).pack(side="left", padx=(0, 0))
+
+
         # Neural levels overview (spans FULL width under the dual section)
         # Shows the current LONG/SHORT level (0..7) for every coin at once.
         neural_box = ttk.LabelFrame(top_controls, text="Neural Levels (0–7)")
@@ -5943,6 +5982,234 @@ class PowerTraderHub(tk.Tk):
 
         except Exception as exc:
             _set_status(f"Unexpected error: {exc}")
+
+        finally:
+            _re_enable()
+
+
+    # ---- Tax Export (Form 8949) ----
+
+    def _on_tax_export_click(self) -> None:
+        """
+        Reads trade_history.jsonl and generates a Form 8949-compatible CSV for the
+        selected tax year. Runs the export in a background thread so the UI stays
+        responsive, then opens the containing folder on completion.
+        """
+        year_str = self._tax_year_var.get().strip()
+        try:
+            year = int(year_str)
+            if year < 2020 or year > 2099:
+                raise ValueError
+        except (ValueError, TypeError):
+            self._tax_status_var.set(f"Invalid year: {year_str}")
+            return
+
+        self._tax_export_btn.configure(state="disabled")
+        self._tax_status_var.set(f"Exporting {year}...")
+
+        t = threading.Thread(
+            target=self._do_tax_export,
+            args=(year,),
+            daemon=True,
+        )
+        t.start()
+
+    def _do_tax_export(self, year: int) -> None:
+        """Background thread: build the 8949 CSV from trade_history.jsonl."""
+        from decimal import Decimal, ROUND_HALF_UP
+        import csv
+
+        def _set_status(msg: str) -> None:
+            self.after(0, lambda: self._tax_status_var.set(msg))
+
+        def _re_enable() -> None:
+            self.after(0, lambda: self._tax_export_btn.configure(state="normal"))
+
+        try:
+            history_path = self.trade_history_path
+            if not os.path.isfile(history_path):
+                _set_status("No trade history file found.")
+                _re_enable()
+                return
+
+            # Read all trades
+            trades = []
+            with open(history_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = (line or "").strip()
+                    if not line:
+                        continue
+                    try:
+                        trades.append(json.loads(line))
+                    except Exception:
+                        continue
+
+            if not trades:
+                _set_status("Trade history is empty.")
+                _re_enable()
+                return
+
+            # Build buy-side tracking for cost basis and acquisition dates.
+            # Uses FIFO-style: earliest buy timestamp = acquisition date.
+            # Resets when a sell fully closes a position.
+            buy_dates = {}    # symbol -> earliest buy ts for current position
+            buy_costs = {}    # symbol -> accumulated Decimal cost
+            buy_qtys = {}     # symbol -> accumulated Decimal qty
+
+            rows_8949 = []
+
+            for t_rec in trades:
+                try:
+                    side = str(t_rec.get("side", "")).lower().strip()
+                    symbol_raw = str(t_rec.get("symbol", "")).upper().strip()
+                    base = symbol_raw.split("-")[0].strip()
+                    ts = float(t_rec.get("ts", 0.0) or 0.0)
+
+                    if not base or ts <= 0.0:
+                        continue
+
+                    qty_d = Decimal(str(t_rec.get("qty", 0) or 0))
+                    price_raw = t_rec.get("price", None)
+                    price_d = Decimal(str(price_raw)) if price_raw is not None else Decimal("0")
+                    fees_raw = t_rec.get("fees_usd", None)
+                    fees_d = Decimal(str(fees_raw)) if fees_raw is not None else Decimal("0")
+
+                    if side == "buy":
+                        if base not in buy_dates or buy_qtys.get(base, Decimal("0")) <= 0:
+                            buy_dates[base] = ts
+                            buy_costs[base] = Decimal("0")
+                            buy_qtys[base] = Decimal("0")
+
+                        bp_delta = t_rec.get("buying_power_delta", None)
+                        if bp_delta is not None:
+                            cost_this_buy = abs(Decimal(str(bp_delta)))
+                        else:
+                            cost_this_buy = (qty_d * price_d) + fees_d
+
+                        buy_costs[base] = buy_costs.get(base, Decimal("0")) + cost_this_buy
+                        buy_qtys[base] = buy_qtys.get(base, Decimal("0")) + qty_d
+
+                    elif side == "sell":
+                        sell_dt = datetime.datetime.fromtimestamp(ts)
+
+                        # Always update position tracking, but only write rows for the target year
+                        sell_frac = Decimal("1")
+                        if buy_qtys.get(base, Decimal("0")) > 0 and qty_d > 0:
+                            sell_frac = min(Decimal("1"), qty_d / buy_qtys[base])
+
+                        bp_delta_sell = t_rec.get("buying_power_delta", None)
+                        if bp_delta_sell is not None:
+                            proceeds_d = Decimal(str(bp_delta_sell)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                        else:
+                            proceeds_d = ((qty_d * price_d) - fees_d).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+                        cost_basis_d = (buy_costs.get(base, Decimal("0")) * sell_frac).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                        gain_loss_d = (proceeds_d - cost_basis_d).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+                        # Only include rows for the target tax year
+                        if sell_dt.year == year:
+                            acquired_dt = datetime.datetime.fromtimestamp(buy_dates.get(base, ts))
+                            qty_str = f"{float(qty_d):.8f}".rstrip("0").rstrip(".")
+                            description = f"{qty_str} {base} (Robinhood Crypto)"
+
+                            rows_8949.append({
+                                "description": description,
+                                "date_acquired": acquired_dt.strftime("%m/%d/%Y"),
+                                "date_sold": sell_dt.strftime("%m/%d/%Y"),
+                                "proceeds": f"{float(proceeds_d):.2f}",
+                                "cost_basis": f"{float(cost_basis_d):.2f}",
+                                "code": "",
+                                "adjustment": "",
+                                "gain_loss": f"{float(gain_loss_d):.2f}",
+                                "hold_period": "Short" if (sell_dt - acquired_dt).days <= 365 else "Long",
+                                "symbol": base,
+                                "tag": str(t_rec.get("tag", "") or ""),
+                                "order_id": str(t_rec.get("order_id", "") or ""),
+                            })
+
+                        # Update position tracking regardless of year
+                        buy_costs[base] = buy_costs.get(base, Decimal("0")) - cost_basis_d
+                        buy_qtys[base] = buy_qtys.get(base, Decimal("0")) - qty_d
+                        if buy_qtys.get(base, Decimal("0")) <= Decimal("0.000000001"):
+                            buy_dates.pop(base, None)
+                            buy_costs.pop(base, None)
+                            buy_qtys.pop(base, None)
+
+                except Exception:
+                    continue
+
+            if not rows_8949:
+                _set_status(f"No sell trades found for {year}.")
+                _re_enable()
+                return
+
+            # Write CSV
+            output_path = os.path.join(self.hub_dir, f"form_8949_trades_{year}.csv")
+
+            fieldnames = [
+                "description", "date_acquired", "date_sold", "proceeds",
+                "cost_basis", "code", "adjustment", "gain_loss",
+                "hold_period", "symbol", "tag", "order_id",
+            ]
+
+            with open(output_path, "w", newline="", encoding="utf-8") as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
+                writer.writerow({
+                    "description": "(a) Description of property",
+                    "date_acquired": "(b) Date acquired",
+                    "date_sold": "(c) Date sold",
+                    "proceeds": "(d) Proceeds",
+                    "cost_basis": "(e) Cost or other basis",
+                    "code": "(f) Code",
+                    "adjustment": "(g) Adjustment",
+                    "gain_loss": "(h) Gain or (loss)",
+                    "hold_period": "Hold Period",
+                    "symbol": "Symbol",
+                    "tag": "Trade Tag",
+                    "order_id": "Order ID",
+                })
+
+                total_proceeds = sum(Decimal(r["proceeds"]) for r in rows_8949)
+                total_cost = sum(Decimal(r["cost_basis"]) for r in rows_8949)
+                total_gain = sum(Decimal(r["gain_loss"]) for r in rows_8949)
+
+                for row in rows_8949:
+                    writer.writerow(row)
+
+                writer.writerow({fn: "" for fn in fieldnames})
+                writer.writerow({
+                    "description": "TOTALS",
+                    "date_acquired": "",
+                    "date_sold": "",
+                    "proceeds": f"{float(total_proceeds):.2f}",
+                    "cost_basis": f"{float(total_cost):.2f}",
+                    "code": "",
+                    "adjustment": "",
+                    "gain_loss": f"{float(total_gain):.2f}",
+                    "hold_period": "",
+                    "symbol": "",
+                    "tag": "",
+                    "order_id": "",
+                })
+
+            count = len(rows_8949)
+            _set_status(f"Done: {count} trades -> {os.path.basename(output_path)}")
+
+            # Open the folder containing the CSV so the user can find it
+            try:
+                folder = os.path.dirname(os.path.abspath(output_path))
+                if sys.platform == "win32":
+                    os.startfile(folder)
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", folder])
+                else:
+                    subprocess.Popen(["xdg-open", folder])
+            except Exception:
+                pass
+
+        except Exception as exc:
+            _set_status(f"Export error: {exc}")
 
         finally:
             _re_enable()
