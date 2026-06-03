@@ -345,6 +345,8 @@ DEFAULT_SETTINGS = {
     "script_neural_trainer": "pt_trainer.py",
     "script_trader": "pt_trader.py",
     "auto_start_scripts": False,
+    "auto_retrain_enabled": True,   # automatically retrain stale coins
+    "auto_retrain_days": 25,        # retrain a coin if trained more than this many days ago
 }
 
 
@@ -1862,6 +1864,12 @@ class PowerTraderHub(tk.Tk):
 
         # internal: when Start All is pressed, we start the runner first and only start the trader once ready
         self._auto_start_trader_pending = False
+
+        # auto-retrain state
+        self._auto_retrain_in_progress: bool = False
+        self._auto_retrain_queue: List[str] = []          # coins queued for sequential auto-retrain
+        self._auto_retrain_last_check: float = 0.0        # throttle: only check once per minute
+        self._auto_retrain_was_running: bool = False      # remember if neural/trader were up before retrain
 
 
         # cache latest trader status so charts can overlay buy/sell lines
@@ -3823,6 +3831,162 @@ class PowerTraderHub(tk.Tk):
 
 
 
+    # ---- Auto-Retrain -------------------------------------------------------
+
+    def _check_auto_retrain(self) -> None:
+        """
+        Called from _tick() once per minute (throttled).
+        If auto_retrain_enabled is True and one or more coins have a
+        trainer_last_training_time.txt older than auto_retrain_days, this method:
+          1. Stops the trader and neural runner (if running).
+          2. Queues the stale coins for sequential retraining.
+          3. Kicks off _auto_retrain_next() to process the queue one coin at a time.
+          4. When the queue is empty, restarts neural + trader (if they were running).
+
+        This method is a no-op if:
+          - auto_retrain_enabled is False in settings.
+          - A retrain is already in progress.
+          - Any trainer is currently running (manual or auto).
+          - All coins are freshly trained.
+        """
+        # Only run once per minute to avoid hammering disk
+        now = time.time()
+        if (now - self._auto_retrain_last_check) < 60.0:
+            return
+        self._auto_retrain_last_check = now
+
+        if not bool(self.settings.get("auto_retrain_enabled", True)):
+            return
+
+        if self._auto_retrain_in_progress:
+            return
+
+        # Don't interrupt a manually triggered trainer
+        if self._running_trainers():
+            return
+
+        try:
+            retrain_days = float(self.settings.get("auto_retrain_days", 25))
+        except Exception:
+            retrain_days = 25.0
+        retrain_seconds = retrain_days * 24.0 * 3600.0
+
+        stale: List[str] = []
+        for coin in self.coins:
+            try:
+                folder = self.coin_folders.get(coin, "")
+                if not folder or not os.path.isdir(folder):
+                    continue
+                stamp_path = os.path.join(folder, "trainer_last_training_time.txt")
+                if not os.path.isfile(stamp_path):
+                    # Never trained — let the normal manual flow handle this
+                    continue
+                with open(stamp_path, "r", encoding="utf-8") as f:
+                    raw = (f.read() or "").strip()
+                ts = float(raw) if raw else 0.0
+                if ts <= 0:
+                    continue
+                age_seconds = now - ts
+                if age_seconds >= retrain_seconds:
+                    stale.append(coin)
+            except Exception:
+                continue
+
+        if not stale:
+            return
+
+        # Record whether the bot was live so we can restart it afterward
+        neural_running = bool(self.proc_neural.proc and self.proc_neural.proc.poll() is None)
+        trader_running = bool(self.proc_trader.proc and self.proc_trader.proc.poll() is None)
+        self._auto_retrain_was_running = neural_running or trader_running
+
+        # Stop live processes before touching training artifacts
+        if neural_running or trader_running:
+            self.stop_all_scripts()
+
+        self._auto_retrain_in_progress = True
+        self._auto_retrain_queue = list(stale)
+
+        stale_str = ", ".join(stale)
+        try:
+            self.status.config(text=f"[AUTO-RETRAIN] Starting for: {stale_str}")
+        except Exception:
+            pass
+
+        # Kick off the sequential queue
+        self.after(500, self._auto_retrain_next)
+
+    def _auto_retrain_next(self) -> None:
+        """
+        Process the next coin in _auto_retrain_queue.
+        When the queue is empty, restart neural + trader if they were running before.
+        """
+        if not self._auto_retrain_queue:
+            # Queue exhausted — all coins retrained
+            self._auto_retrain_in_progress = False
+
+            try:
+                self.status.config(text="[AUTO-RETRAIN] All coins retrained. Restarting bot...")
+            except Exception:
+                pass
+
+            if self._auto_retrain_was_running:
+                # Use the same Start All sequence (runner ready gate → trader)
+                self.after(1000, self.start_all_scripts)
+
+            return
+
+        coin = self._auto_retrain_queue[0]
+
+        try:
+            self.status.config(text=f"[AUTO-RETRAIN] Training {coin} ({len(self._auto_retrain_queue)} remaining)...")
+        except Exception:
+            pass
+
+        # Launch trainer for this coin (reuses existing start_trainer_for_selected_coin logic)
+        try:
+            self.trainer_coin_var.set(coin)
+            self.start_trainer_for_selected_coin()
+        except Exception:
+            # If trainer launch failed, skip this coin and continue
+            self._auto_retrain_queue.pop(0)
+            self.after(500, self._auto_retrain_next)
+            return
+
+        # Poll until this coin's trainer process finishes, then move to the next
+        self.after(5000, lambda: self._auto_retrain_poll_coin(coin))
+
+    def _auto_retrain_poll_coin(self, coin: str) -> None:
+        """
+        Poll every 5 seconds until the trainer for `coin` finishes,
+        then pop it from the queue and call _auto_retrain_next().
+        """
+        if not self._auto_retrain_in_progress:
+            # Retrain was cancelled externally (e.g. user pressed Stop All)
+            return
+
+        lp = self.trainers.get(coin)
+        trainer_still_running = bool(
+            lp and lp.info.proc and lp.info.proc.poll() is None
+        )
+
+        if trainer_still_running:
+            # Still going — keep polling
+            self.after(5000, lambda: self._auto_retrain_poll_coin(coin))
+            return
+
+        # Trainer finished (or died) — move to next coin
+        try:
+            if self._auto_retrain_queue and self._auto_retrain_queue[0] == coin:
+                self._auto_retrain_queue.pop(0)
+        except Exception:
+            pass
+
+        # Small pause between sequential trainers to let file handles close
+        self.after(2000, self._auto_retrain_next)
+
+    # ---- End Auto-Retrain ---------------------------------------------------
+
     def stop_trainer_for_selected_coin(self) -> None:
         coin = (self.trainer_coin_var.get() or "").strip().upper()
         lp = self.trainers.get(coin)
@@ -4072,6 +4236,10 @@ class PowerTraderHub(tk.Tk):
             pass
 
         self.status.config(text=f"{_now_str()} | hub_dir={self.hub_dir}")
+
+        # Scheduled auto-retrain check (throttled to once per minute inside the method)
+        self._check_auto_retrain()
+
         self.after(int(float(self.settings.get("ui_refresh_seconds", 1.0)) * 1000), self._tick)
 
 
@@ -4927,6 +5095,8 @@ class PowerTraderHub(tk.Tk):
         chart_refresh_var = tk.StringVar(value=str(self.settings["chart_refresh_seconds"]))
         candles_limit_var = tk.StringVar(value=str(self.settings["candles_limit"]))
         auto_start_var = tk.BooleanVar(value=bool(self.settings.get("auto_start_scripts", False)))
+        auto_retrain_enabled_var = tk.BooleanVar(value=bool(self.settings.get("auto_retrain_enabled", True)))
+        auto_retrain_days_var = tk.StringVar(value=str(self.settings.get("auto_retrain_days", 25)))
 
         r = 0
         add_row(r, "Main neural folder:", main_dir_var, browse="dir"); r += 1
@@ -5603,6 +5773,11 @@ class PowerTraderHub(tk.Tk):
         chk = ttk.Checkbutton(frm, text="Auto start scripts on GUI launch", variable=auto_start_var)
         chk.grid(row=r, column=0, columnspan=3, sticky="w", pady=(10, 0)); r += 1
 
+        chk_retrain = ttk.Checkbutton(frm, text="Auto-retrain stale coins (recommended)", variable=auto_retrain_enabled_var)
+        chk_retrain.grid(row=r, column=0, columnspan=3, sticky="w", pady=(6, 0)); r += 1
+
+        add_row(r, "Auto-retrain interval (days):", auto_retrain_days_var); r += 1
+
         btns = ttk.Frame(frm)
         btns.grid(row=r, column=0, columnspan=3, sticky="ew", pady=14)
         btns.columnconfigure(0, weight=1)
@@ -5689,6 +5864,16 @@ class PowerTraderHub(tk.Tk):
                 self.settings["chart_refresh_seconds"] = float(chart_refresh_var.get().strip())
                 self.settings["candles_limit"] = int(float(candles_limit_var.get().strip()))
                 self.settings["auto_start_scripts"] = bool(auto_start_var.get())
+
+                self.settings["auto_retrain_enabled"] = bool(auto_retrain_enabled_var.get())
+                try:
+                    ard = float((auto_retrain_days_var.get() or "").strip())
+                    if ard < 1.0:
+                        ard = 1.0
+                    self.settings["auto_retrain_days"] = ard
+                except Exception:
+                    self.settings["auto_retrain_days"] = float(self.settings.get("auto_retrain_days", 25))
+
                 self._save_settings()
 
                 # If new coin(s) were added and their training folder doesn't exist yet,
