@@ -11,6 +11,7 @@ Fully automated crypto trading powered by a custom price prediction AI and a str
 This fork builds on garagesteve's excellent foundation with features specifically designed for small account profitability, capital preservation, and tax compliance. All changes are backward compatible — set `account_mode: "force_existing"` to revert to 100% original behavior.
 
 ### Small Account Optimization (accounts under $2,500)
+
 - **Auto-detection** of account size with appropriate settings applied automatically
 - **10% position sizing** instead of 0.005% (turns $0.50 trades into $25 trades)
 - **Linear DCA** (equal-size buys) instead of exponential (2x multiplier)
@@ -19,17 +20,37 @@ This fork builds on garagesteve's excellent foundation with features specificall
 - **20% cash reserve** enforced to maintain dry powder
 
 ### Risk Management
+
 - **Hard stop loss at -35%** with one-time neural L7 override before forced exit
 - **Tiered profit taking** — sell 33% at +7%, 50% of remainder at +15%, trail the rest
 - **Neural DCA confirmation** required before executing DCA entries on small accounts
 
+### Automatic Retraining
+
+- **Scheduled auto-retrain** — bot detects stale coin models and retrains them automatically without any manual intervention
+- **Configurable interval** — default is every 25 days; adjustable down to 1 day via the Settings dialog ("Auto-retrain interval (days)")
+- **Safe sequencing** — automatically stops the trader and neural runner before training begins, then restarts both when all stale coins are done
+- **One coin at a time** — trains each stale coin sequentially to prevent resource contention
+- **Won't double-run** — skips auto-retrain if a manual trainer is already running
+- **Status bar feedback** — displays `[AUTO-RETRAIN] Training ETH (3 remaining)...` during the process
+- **Configurable via Settings** — checkbox to enable/disable and a day-interval field, both saved to `gui_settings.json`
+
+New `gui_settings.json` keys added by this feature (with safe defaults — existing config files that are missing these keys work without any changes):
+
+```json
+"auto_retrain_enabled": true,
+"auto_retrain_days": 25
+```
+
 ### Enhanced GUI
+
 - **Win rate %**, average win/loss, best/worst coin, and hard stop count in the Account box
 - **Manual Buy panel** — place market buys from the Hub with auto coin-add and optional auto-train
 - **Manual Sell panel** — select a held coin and sell 100% from the Hub
 - **Tax Export panel** — one-click IRS Form 8949 CSV export for any tax year
 
 ### Data Accuracy
+
 - **Paginated order fetching** — follows Robinhood's pagination up to 25 pages per coin to prevent cost basis corruption
 - **Decimal precision P&L** — uses Python's `Decimal` type for cent-accurate profit/loss tracking
 - **Form 8949 CSV export** — generates a tax-ready CSV with all required IRS columns, compatible with TurboTax, H&R Block, FreeTaxUSA, and other tax software
@@ -47,18 +68,20 @@ Python 3.10+
 ```
 
 Install dependencies:
-```bash
+
+```
 python -m pip install -r requirements.txt
 ```
 
 If using Python 3.12+:
-```bash
+
+```
 python -m pip install "setuptools==81.0.0"
 ```
 
 ### Run
 
-```bash
+```
 python pt_hub.py
 ```
 
@@ -66,13 +89,13 @@ python pt_hub.py
 
 ## Files
 
-| File | Role |
-|---|---|
-| `pt_hub.py` | GUI dashboard — tkinter interface, charts, account display, manual buy/sell, tax export |
-| `pt_trader.py` | Core trading engine — order execution, DCA logic, position management, tax export |
-| `pt_thinker.py` | Neural network runner — generates buy/sell signal levels |
-| `pt_trainer.py` | Neural network trainer — trains models on market data |
-| `requirements.txt` | Python package dependencies |
+| File               | Role                                                                                    |
+| ------------------ | --------------------------------------------------------------------------------------- |
+| `pt_hub.py`        | GUI dashboard — tkinter interface, charts, account display, manual buy/sell, tax export, auto-retrain scheduler |
+| `pt_trader.py`     | Core trading engine — order execution, DCA logic, position management, tax export       |
+| `pt_thinker.py`    | Neural network runner — generates buy/sell signal levels                                |
+| `pt_trainer.py`    | Neural network trainer — trains models on market data                                   |
+| `requirements.txt` | Python package dependencies                                                             |
 
 ---
 
@@ -84,6 +107,8 @@ All settings are in `gui_settings.json`. Key settings for this fork:
 {
   "account_mode": "auto",
   "small_account_threshold": 2500,
+  "auto_retrain_enabled": true,
+  "auto_retrain_days": 25,
   "small_account_settings": {
     "start_allocation_pct": 10.0,
     "dca_multiplier": 1.0,
@@ -108,7 +133,8 @@ All settings are in `gui_settings.json`. Key settings for this fork:
 ```
 
 To revert to 100% original behavior:
-```json
+
+```
 "account_mode": "force_existing"
 ```
 
