@@ -1,4 +1,4 @@
-# PowerTrader AI V1.3 — Fork
+# PowerTrader AI V1.4 — Fork
 
 Fully automated crypto trading powered by a custom price prediction AI and a structured/tiered DCA system, enhanced with small account optimization, risk management, and IRS tax export.
 
