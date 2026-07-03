@@ -157,6 +157,8 @@ _GUI_SETTINGS_PATH = os.environ.get("POWERTRADER_GUI_SETTINGS") or os.path.join(
 _gui_settings_cache = {
 	"mtime": None,
 	"coins": ['BTC', 'ETH', 'XRP', 'BNB', 'DOGE'],  # fallback defaults
+	"main_neural_dir": "",          # populated by _load_gui_coins(); used by _coin_is_trained()
+	"auto_retrain_days": 25.0,      # matches pt_hub.py default
 }
 
 def _load_gui_coins() -> list:
@@ -185,6 +187,12 @@ def _load_gui_coins() -> list:
 
 		_gui_settings_cache["mtime"] = mtime
 		_gui_settings_cache["coins"] = coins
+		_gui_settings_cache["main_neural_dir"] = str(data.get("main_neural_dir") or "").strip()
+		try:
+			ard = float(data.get("auto_retrain_days") or 25)
+			_gui_settings_cache["auto_retrain_days"] = ard if ard > 0 else 25.0
+		except Exception:
+			_gui_settings_cache["auto_retrain_days"] = 25.0
 		return list(coins)
 	except Exception:
 		return list(_gui_settings_cache["coins"])
@@ -202,22 +210,38 @@ def coin_folder(sym: str) -> str:
 
 
 # --- training freshness gate (mirrors pt_hub.py) ---
-_TRAINING_STALE_SECONDS = 14 * 24 * 60 * 60  # 14 days
+_TRAINING_STALE_DAYS_DEFAULT = 25.0  # matches pt_hub.py auto_retrain_days default
+
+def _neural_coin_folder(sym: str) -> str:
+	"""
+	Returns the coin folder inside main_neural_dir (C:\\PTAI by default) — the
+	directory where pt_trainer.py writes its artifacts including
+	trainer_last_training_time.txt.  This is DIFFERENT from coin_folder() which
+	returns the script-directory path used for runtime signal files.
+
+	Falls back to BASE_DIR if main_neural_dir is not configured in gui_settings.json.
+	"""
+	sym = sym.upper()
+	nd = (_gui_settings_cache.get("main_neural_dir") or "").strip()
+	if not nd:
+		nd = BASE_DIR
+	return nd if sym == 'BTC' else os.path.join(nd, sym)
 
 def _coin_is_trained(sym: str) -> bool:
 	"""
-	Training freshness gate:
+	Training freshness gate — mirrors pt_hub.py exactly:
 
-	pt_trainer.py writes `trainer_last_training_time.txt` in the coin folder
-	when training starts. If that file is missing OR older than 14 days, we treat
-	the coin as NOT TRAINED.
+	  1. Looks for trainer_last_training_time.txt in main_neural_dir (C:\\PTAI),
+	     the same location pt_trainer.py writes it to.  The previous version
+	     incorrectly looked in the script directory (BASE_DIR), which is a
+	     different path and caused all alt-coins to read as NOT TRAINED even
+	     when the GUI Training panel showed TRAINED.
 
-	This is intentionally the same logic as pt_hub.py so runner behavior matches
-	what the GUI shows.
+	  2. Uses auto_retrain_days from gui_settings.json (default 25) instead of
+	     a hardcoded 14-day constant, so the threshold always matches the GUI.
 	"""
-
 	try:
-		folder = coin_folder(sym)
+		folder = _neural_coin_folder(sym)
 		stamp_path = os.path.join(folder, "trainer_last_training_time.txt")
 		if not os.path.isfile(stamp_path):
 			return False
@@ -226,7 +250,13 @@ def _coin_is_trained(sym: str) -> bool:
 		ts = float(raw) if raw else 0.0
 		if ts <= 0:
 			return False
-		return (time.time() - ts) <= _TRAINING_STALE_SECONDS
+		try:
+			retrain_days = float(_gui_settings_cache.get("auto_retrain_days") or _TRAINING_STALE_DAYS_DEFAULT)
+			if retrain_days <= 0:
+				retrain_days = _TRAINING_STALE_DAYS_DEFAULT
+		except Exception:
+			retrain_days = _TRAINING_STALE_DAYS_DEFAULT
+		return (time.time() - ts) <= (retrain_days * 24 * 60 * 60)
 	except Exception:
 		return False
 
@@ -266,7 +296,7 @@ for _sym in CURRENT_COINS:
 
 
 distance = 0.5
-tf_choices = ['1hour', '2hour', '4hour', '8hour', '12hour', '1day', '1week']
+tf_choices = ['15min', '30min', '1hour', '2hour', '4hour', '8hour', '12hour', '1day', '1week']
 
 def new_coin_state():
 	return {
@@ -548,7 +578,16 @@ def step_coin(sym: str):
 	last_difference_between = 0.0
 
 
-	# ====== ORIGINAL: fetch current candle for this timeframe index ======
+	# ====== fetch recent candles for this timeframe (multi-candle + volume) ======
+	# We need the last few candles to build a multi-candle pattern with volume ratios.
+	# KuCoin returns newest-first; we need at least 21 candles for a 20-candle volume
+	# average plus the current pattern candles.
+	# NOTE: trainer's number_of_candles=[3] means (3-1)=2 candles in the pattern.
+	# _PATTERN_CANDLES must match that: 2 candles per pattern.
+	_PATTERN_CANDLES = 2  # must equal trainer's number_of_candles[0] - 1
+	_VOL_AVG_WINDOW = 20  # rolling window for relative volume calculation
+	_candles_needed = _VOL_AVG_WINDOW + _PATTERN_CANDLES + 1  # extra safety margin
+
 	while True:
 		history_list = []
 		while True:
@@ -564,43 +603,101 @@ def step_coin(sym: str):
 				continue
 		history_list = history.split("], [")
 		# KuCoin can occasionally return an empty/short kline response.
-		# Guard against history_list[1] raising IndexError.
-		if len(history_list) < 2:
+		if len(history_list) < _candles_needed:
 			time.sleep(0.2)
 			continue
-		working_minute = str(history_list[1]).replace('"', '').replace("'", "").split(", ")
-		try:
-			openPrice = float(working_minute[1])
-			closePrice = float(working_minute[2])
-			break
-		except Exception:
+
+		# Parse all returned candles: [time, open, close, high, low, volume, turnover]
+		_parsed_candles = []
+		for _row_str in history_list:
+			_fields = str(_row_str).replace('"', '').replace("'", "").split(", ")
+			try:
+				_o = float(_fields[1])
+				_c = float(_fields[2])
+				_h = float(_fields[3])
+				_l = float(_fields[4])
+				_v = float(_fields[5]) if len(_fields) > 5 else 0.0
+				_parsed_candles.append({"open": _o, "close": _c, "high": _h, "low": _l, "vol": _v})
+			except Exception:
+				continue
+
+		if len(_parsed_candles) < 1 + _PATTERN_CANDLES + _VOL_AVG_WINDOW:
+			time.sleep(0.2)
 			continue
 
+		# KuCoin returns newest first — candle[0] is the in-progress candle,
+		# candle[1] is the most recently closed candle.
+		# Build the current pattern from the most recent _PATTERN_CANDLES closed candles.
+		# For a 2-candle pattern: indices 1 and 2 (newest closed, and the one before).
+		# Pattern order: oldest first, so we reverse.
+		_pattern_raw = _parsed_candles[1:1 + _PATTERN_CANDLES]
+		_pattern_raw.reverse()  # oldest first
 
-	current_candle = 100 * ((closePrice - openPrice) / openPrice)
+		# Compute % change for each candle in the pattern
+		current_pattern_changes = []
+		current_pattern_vol_ratios = []
+		for _pc in _pattern_raw:
+			if _pc["open"] != 0.0:
+				current_pattern_changes.append(100.0 * ((_pc["close"] - _pc["open"]) / _pc["open"]))
+			else:
+				current_pattern_changes.append(0.0)
 
-	# ====== ORIGINAL: load threshold + memories/weights and compute moves ======
-	file = open('neural_perfect_threshold_' + tf_choices[tf_choice_index] + '.txt', 'r')
-	perfect_threshold = float(file.read())
-	file.close()
+		# Compute relative volume for each pattern candle
+		# Volume average uses candles OLDER than the pattern candles
+		_vol_window_start = 1 + _PATTERN_CANDLES
+		_vol_window_end = _vol_window_start + _VOL_AVG_WINDOW
+		_vol_window_candles = _parsed_candles[_vol_window_start:_vol_window_end]
+		_vol_avg = 0.0
+		if _vol_window_candles:
+			_vol_sum = sum(vc["vol"] for vc in _vol_window_candles)
+			_vol_avg = _vol_sum / len(_vol_window_candles) if _vol_sum > 0 else 0.0
+
+		for _pc in _pattern_raw:
+			if _vol_avg > 0.0:
+				current_pattern_vol_ratios.append(_pc["vol"] / _vol_avg)
+			else:
+				current_pattern_vol_ratios.append(1.0)
+
+		# Build the full current pattern: [change_1, vol_ratio_1, change_2, vol_ratio_2, ...]
+		# This interleaved format matches what the trainer stores.
+		current_pattern_full = []
+		for _ci in range(len(current_pattern_changes)):
+			current_pattern_full.append(current_pattern_changes[_ci])
+			current_pattern_full.append(current_pattern_vol_ratios[_ci])
+
+		# Keep openPrice/closePrice from the newest closed candle for prediction math below
+		openPrice = _pattern_raw[-1]["open"]
+		closePrice = _pattern_raw[-1]["close"]
+		current_candle = current_pattern_changes[-1]  # last candle's % change (for legacy compat)
+		break
+
+
+	# ====== load threshold + memories/weights and compute moves (multi-candle + volume aware) ======
+	# Default threshold — overwritten inside the try block if the file exists.
+	# Initialised here so line 802 (write-back) never hits a NameError when the read fails.
+	perfect_threshold = 1.0
 
 	try:
 		# If we can read/parse training files, this timeframe is NOT a training-file issue.
 		training_issues[tf_choice_index] = 0
 
-		file = open('memories_' + tf_choices[tf_choice_index] + '.txt', 'r')
+		file = open(os.path.join(_neural_coin_folder(sym), 'neural_perfect_threshold_' + tf_choices[tf_choice_index] + '.txt'), 'r')
+		perfect_threshold = float(file.read())
+		file.close()
+
+		file = open(os.path.join(_neural_coin_folder(sym), 'memories_' + tf_choices[tf_choice_index] + '.txt'), 'r')
 		memory_list = file.read().replace("'", "").replace(',', '').replace('"', '').replace(']', '').replace('[', '').split('~')
 		file.close()
 
-		file = open('memory_weights_' + tf_choices[tf_choice_index] + '.txt', 'r')
+		file = open(os.path.join(_neural_coin_folder(sym), 'memory_weights_' + tf_choices[tf_choice_index] + '.txt'), 'r')
 		weight_list = file.read().replace("'", "").replace(',', '').replace('"', '').replace(']', '').replace('[', '').split(' ')
 		file.close()
 
-		file = open('memory_weights_high_' + tf_choices[tf_choice_index] + '.txt', 'r')
+		file = open(os.path.join(_neural_coin_folder(sym), 'memory_weights_high_' + tf_choices[tf_choice_index] + '.txt'), 'r')
 		high_weight_list = file.read().replace("'", "").replace(',', '').replace('"', '').replace(']', '').replace('[', '').split(' ')
 		file.close()
 
-		file = open('memory_weights_low_' + tf_choices[tf_choice_index] + '.txt', 'r')
+		file = open(os.path.join(_neural_coin_folder(sym), 'memory_weights_low_' + tf_choices[tf_choice_index] + '.txt'), 'r')
 		low_weight_list = file.read().replace("'", "").replace(',', '').replace('"', '').replace(']', '').replace('[', '').split(' ')
 		file.close()
 
@@ -619,18 +716,35 @@ def step_coin(sym: str):
 
 		while True:
 			memory_pattern = memory_list[mem_ind].split('{}')[0].replace("'", "").replace(',', '').replace('"', '').replace(']', '').replace('[', '').split(' ')
-			check_dex = 0
-			memory_candle = float(memory_pattern[check_dex])
 
-			if current_candle == 0.0 and memory_candle == 0.0:
-				difference = 0.0
+			# Multi-element pattern comparison: compare ALL elements of the current
+			# pattern against ALL elements of the memory pattern.
+			# Memory patterns from the trainer are interleaved: [change vol_ratio change vol_ratio ... outcome]
+			# The last element is the outcome (predicted % move) — skip it for comparison.
+			_mem_compare_elements = len(memory_pattern) - 1  # exclude the outcome element
+			_cur_compare_elements = len(current_pattern_full)
+
+			# Use whichever is shorter to avoid index errors (handles old vs new memory formats)
+			_n_compare = min(_mem_compare_elements, _cur_compare_elements)
+
+			if _n_compare > 0:
+				checks = []
+				check_dex = 0
+				while check_dex < _n_compare:
+					_cur_val = current_pattern_full[check_dex]
+					_mem_val = float(memory_pattern[check_dex])
+
+					if _cur_val == 0.0 and _mem_val == 0.0:
+						checks.append(0.0)
+					else:
+						try:
+							checks.append(abs((abs(_cur_val - _mem_val) / ((_cur_val + _mem_val) / 2)) * 100))
+						except:
+							checks.append(0.0)
+					check_dex += 1
+				diff_avg = sum(checks) / len(checks)
 			else:
-				try:
-					difference = abs((abs(current_candle - memory_candle) / ((current_candle + memory_candle) / 2)) * 100)
-				except:
-					difference = 0.0
-
-			diff_avg = difference
+				diff_avg = 999999.0  # can't compare, force no match
 
 			if diff_avg <= perfect_threshold:
 				any_perfect = 'yes'
@@ -689,9 +803,12 @@ def step_coin(sym: str):
 		perfects.insert(tf_choice_index, 'inactive')
 
 	# keep threshold persisted (original behavior)
-	file = open('neural_perfect_threshold_' + tf_choices[tf_choice_index] + '.txt', 'w+')
-	file.write(str(perfect_threshold))
-	file.close()
+	try:
+		file = open(os.path.join(_neural_coin_folder(sym), 'neural_perfect_threshold_' + tf_choices[tf_choice_index] + '.txt'), 'w+')
+		file.write(str(perfect_threshold))
+		file.close()
+	except Exception:
+		pass
 
 	# ====== ORIGINAL: compute new high/low predictions ======
 	price_list2 = [openPrice, closePrice]

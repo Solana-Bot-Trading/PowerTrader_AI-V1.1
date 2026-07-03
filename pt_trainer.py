@@ -240,8 +240,8 @@ try:
 		pass
 except:
 	restarted_yet = 0
-tf_choices = ['1hour', '2hour', '4hour', '8hour', '12hour', '1day', '1week']
-tf_minutes = [60, 120, 240, 480, 720, 1440, 10080]
+tf_choices = ['15min', '30min', '1hour', '2hour', '4hour', '8hour', '12hour', '1day', '1week']
+tf_minutes = [15, 30, 60, 120, 240, 480, 720, 1440, 10080]
 # --- GUI HUB INPUT (NO PROMPTS) ---
 # Usage: python pt_trainer.py BTC [reprocess_yes|reprocess_no]
 _arg_coin = "BTC"
